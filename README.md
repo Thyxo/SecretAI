@@ -3,11 +3,14 @@
 Tryk en hotkey, skriv din prompt, tryk hotkey igen → svaret fra DeepSeek ligger i dit clipboard.
 Kører usynligt i baggrunden (kun Windows).
 
+## Statusvindue
+Når du starter programmet, åbner et lille vindue, der viser om alt kører (grønne prikker), om du er logget ind, og som har knapper til login og en testboks. Luk det med X – programmet kører videre. Åbn det igen ved at dobbeltklikke på det grønne tray-ikon nederst til højre. Du kan slå «Vis vindue ved start» fra i vinduet.
+
 ## Første gang
 1. Installer Python 3 (sæt kryds ved *Add to PATH*) og Google Chrome.
 2. Dobbeltklik `setup.bat`.
 3. Dobbeltklik `start_hidden.vbs`. Chrome åbner – log ind på DeepSeek, og klar «verify».
-4. Åbn `http://localhost:8000` (tray-ikon → *Åbn login / status*) og tryk **«2 · Jeg er logget ind»**.
+4. Tryk **«2 · Jeg er logget ind»** i statusvinduet.
 5. Valgfrit: `install_autostart.bat` starter SecretAI automatisk med Windows.
 
 ## Daglig brug

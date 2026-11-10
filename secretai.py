@@ -4,10 +4,11 @@ Hotkey (standard Ctrl+Alt+Space) → begynd at skrive din prompt (tastetryk fang
 IKKE videre til det aktive program) → tryk hotkey igen → svaret lægges i clipboardet.
 
 Prik nederst til højre:  rød = optager · orange = AI tænker · grøn = svar i clipboard · lilla = fejl
-Esc under optagelse = annullér. Tray-ikonet bruges til at slå prikken fra og afslutte.
+Esc under optagelse = annullér. Dobbeltklik på tray-ikonet åbner det lille statusvindue.
 """
-import ctypes, ctypes.wintypes as wt, json, logging, os, queue, subprocess, sys, threading
+import ctypes, ctypes.wintypes as wt, json, logging, os, queue, subprocess, sys, threading, time
 import tkinter as tk
+from tkinter import ttk
 import urllib.error, urllib.request, webbrowser
 
 import pyperclip, pystray
@@ -23,6 +24,7 @@ log = logging.getLogger("secretai")
 CONFIG_PATH = os.path.join(HERE, "config.json")
 DEFAULTS = {
     "hotkey": "ctrl+alt+space",   # fx "ctrl+shift+f9", "f9", "ctrl+alt+d"
+    "show_window_on_start": True,  # vis det lille statusvindue når programmet starter
     "dot": True,                  # lille prik nederst til højre (kan også slås fra i tray-menuen)
     "suppress_keys": True,        # True = tastetryk under optagelse når IKKE frem til det aktive program
     "bridge_port": 8000,
@@ -249,6 +251,9 @@ def cancel():
     ui_q.put(("hide",))
 
 
+last = {"answer": "", "error": "", "ver": 0}      # seneste resultat, vises i vinduet
+
+
 def run_query(text):
     global state
     try:
@@ -256,14 +261,19 @@ def run_query(text):
         answer = ask_bridge(text).strip()
         pyperclip.copy(answer)
         log.info("Svar i clipboard (%d tegn)", len(answer))
+        last.update(answer=answer, error="", ver=last["ver"] + 1)
         ui_q.put(("dot", COLORS["ok"], 2500))
     except BridgeError as e:
         log.error("Bridge-fejl %s", e)
-        if e.status in (401, 409):                 # logget ud / login-tilstand → åbn GUI
-            webbrowser.open(BRIDGE)
+        msg = ("Ikke logget ind på DeepSeek – brug knap 1 og 2 i vinduet." if e.status in (401, 409)
+               else (e.detail or f"Fejl {e.status}"))
+        last.update(answer="", error=msg, ver=last["ver"] + 1)
+        if e.status in (401, 409):
+            ui_q.put(("window",))
         ui_q.put(("dot", COLORS["err"], 4000))
     except Exception:
         log.exception("Fejl under forespørgsel (kører bridgen?)")
+        last.update(answer="", error="Bridgen svarer ikke. Se bridge.log.", ver=last["ver"] + 1)
         ui_q.put(("dot", COLORS["err"], 4000))
     finally:
         state = IDLE
@@ -319,6 +329,207 @@ def win_filter(msg, data):
     return False                        # vi har selv håndteret alt – ingen on_press nødvendig
 
 
+# ------------------------------------------------------------------ Statusvindue
+START_TIME = time.time()
+bridge_status = {"up": False}
+
+
+def poll_status():
+    global bridge_status
+    while True:
+        try:
+            with urllib.request.urlopen(BRIDGE + "/status", timeout=3) as r:
+                st = json.load(r)
+            st["up"] = True
+        except Exception:
+            st = {"up": False}
+        bridge_status = st
+        time.sleep(2.5)
+
+
+def post_json(path, body, timeout=90):
+    req = urllib.request.Request(BRIDGE + path, data=json.dumps(body).encode(),
+                                 headers={"content-type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=timeout).read()
+        return True, ""
+    except urllib.error.HTTPError as e:
+        try:
+            return False, json.loads(e.read()).get("detail", "")
+        except Exception:
+            return False, str(e)
+    except Exception:
+        return False, "Bridgen svarer ikke."
+
+
+class MainWin:
+    GREEN, RED, ORANGE, GREY = "#2e9e4f", "#d33a3a", "#e08a00", "#999999"
+
+    def __init__(self, root):
+        t = self.top = tk.Toplevel(root)
+        t.title("SecretAI")
+        t.geometry("440x640")
+        t.minsize(380, 560)
+        t.protocol("WM_DELETE_WINDOW", self.hide)        # X skjuler kun – programmet kører videre
+        self.hk = "+".join(p.capitalize() for p in cfg["hotkey"].split("+"))
+        self.seen_ver, self.pending_msg = 0, None
+
+        self.banner = tk.Label(t, text="", font=("Segoe UI", 13, "bold"), fg="white",
+                               pady=14, wraplength=400, justify="center")
+        self.banner.pack(fill="x")
+
+        box = ttk.LabelFrame(t, text="Status")
+        box.pack(fill="x", padx=14, pady=(12, 6))
+        self.rows = []
+        for name in ("SecretAI-programmet", "Bridge til DeepSeek", "Login på DeepSeek"):
+            f = ttk.Frame(box)
+            f.pack(fill="x", padx=8, pady=3)
+            dot = tk.Label(f, text="●", font=("Segoe UI", 14), fg=self.GREY)
+            dot.pack(side="left")
+            ttk.Label(f, text=name, width=21).pack(side="left", padx=(6, 0))
+            txt = ttk.Label(f, text="…", wraplength=170)
+            txt.pack(side="left")
+            self.rows.append((dot, txt))
+
+        how = ttk.LabelFrame(t, text="Sådan bruger du det")
+        how.pack(fill="x", padx=14, pady=6)
+        ttk.Label(how, justify="left", text=(
+            f"1. Tryk {self.hk} og skriv din prompt\n"
+            f"2. Tryk {self.hk} igen\n"
+            "3. Vent på grøn prik nederst til højre, og tryk Ctrl+V")).pack(anchor="w", padx=8, pady=6)
+
+        lg = ttk.LabelFrame(t, text="DeepSeek-login (første gang, eller hvis det udløber)")
+        lg.pack(fill="x", padx=14, pady=6)
+        ttk.Button(lg, text="1 · Åbn login-vindue", command=lambda: self.bridge_mode(False)).pack(fill="x", padx=8, pady=(8, 3))
+        ttk.Button(lg, text="2 · Jeg er logget ind", command=lambda: self.bridge_mode(True)).pack(fill="x", padx=8, pady=3)
+        self.msg = ttk.Label(lg, text="", wraplength=390, foreground="#666666")
+        self.msg.pack(anchor="w", padx=8, pady=(0, 6))
+
+        ts = ttk.LabelFrame(t, text="Test et spørgsmål")
+        ts.pack(fill="both", expand=True, padx=14, pady=6)
+        row = ttk.Frame(ts)
+        row.pack(fill="x", padx=8, pady=(8, 4))
+        self.entry = ttk.Entry(row)
+        self.entry.pack(side="left", fill="x", expand=True)
+        self.entry.bind("<Return>", lambda e: self.send_test())
+        ttk.Button(row, text="Send", command=self.send_test).pack(side="left", padx=(6, 0))
+        self.out = tk.Text(ts, height=5, wrap="word", state="disabled", font=("Segoe UI", 10))
+        self.out.pack(fill="both", expand=True, padx=8, pady=4)
+        ttk.Button(ts, text="Kopiér svar", command=lambda: pyperclip.copy(last["answer"])).pack(anchor="e", padx=8, pady=(0, 8))
+
+        foot = ttk.Frame(t)
+        foot.pack(fill="x", padx=14, pady=(2, 12))
+        self.var_dot = tk.BooleanVar(value=cfg["dot"])
+        self.var_start = tk.BooleanVar(value=cfg["show_window_on_start"])
+        ttk.Checkbutton(foot, text="Vis prik", variable=self.var_dot, command=self.save_opts).pack(side="left")
+        ttk.Checkbutton(foot, text="Vis vindue ved start", variable=self.var_start, command=self.save_opts).pack(side="left", padx=10)
+        ttk.Button(foot, text="Afslut", command=lambda: ui_q.put(("quit",))).pack(side="right")
+
+        t.withdraw()
+        t.after(600, self.tick)
+
+    # -- handlinger
+    def show(self):
+        self.top.deiconify()
+        self.top.lift()
+        self.top.focus_force()
+
+    def hide(self):
+        self.top.withdraw()
+
+    def save_opts(self):
+        cfg["dot"], cfg["show_window_on_start"] = self.var_dot.get(), self.var_start.get()
+        save_cfg(cfg)
+        ui_q.put(("refresh",))
+
+    def bridge_mode(self, headless):
+        self.msg.config(text="Arbejder … (kan tage et par sekunder)")
+
+        def work():
+            ok, detail = post_json("/admin/mode", {"headless": headless})
+            if not ok:
+                self.pending_msg = "Fejl: " + detail
+            elif headless:
+                self.pending_msg = "Færdig. Programmet kører nu usynligt i baggrunden."
+            else:
+                self.pending_msg = "Chrome-vinduet er åbnet. Log ind på DeepSeek der, og tryk så knap 2."
+        threading.Thread(target=work, daemon=True).start()
+
+    def send_test(self):
+        global state
+        text = self.entry.get().strip()
+        if not text or state != IDLE:
+            return
+        state = THINKING
+        ui_q.put(("dot", COLORS["think"], None))
+        threading.Thread(target=run_query, args=(text,), daemon=True).start()
+
+    # -- opdatering
+    def tick(self):
+        try:
+            if self.top.state() != "withdrawn":
+                self.refresh()
+        except tk.TclError:
+            return
+        except Exception:
+            log.exception("fejl i statusvindue")
+        self.top.after(600, self.tick)
+
+    def row(self, i, color, text):
+        self.rows[i][0].config(fg=color)
+        self.rows[i][1].config(text=text)
+
+    def refresh(self):
+        s = bridge_status
+        up, mode, login = s.get("up"), s.get("mode"), s.get("login")
+        starting = not up and time.time() - START_TIME < 40
+
+        self.row(0, self.GREEN, f"kører (hotkey {self.hk})")
+        if up:
+            self.row(1, self.GREEN, "kører")
+        elif starting:
+            self.row(1, self.ORANGE, "starter …")
+        else:
+            self.row(1, self.RED, "kører ikke (se bridge.log)")
+        if not up:
+            self.row(2, self.GREY, "–")
+        elif mode == "login":
+            self.row(2, self.ORANGE, "log ind i Chrome-vinduet")
+        elif login == "ja":
+            self.row(2, self.GREEN, "logget ind")
+        elif login == "nej":
+            self.row(2, self.RED, "ikke logget ind")
+        else:
+            self.row(2, self.ORANGE, "ukendt – prøv en test")
+
+        if state == RECORDING:
+            color, text = self.RED, f"Optager … {len(buf)} tegn\nTryk {self.hk} igen for at sende"
+        elif state == THINKING:
+            color, text = self.ORANGE, "AI tænker …"
+        elif not up:
+            color, text = (self.ORANGE, "Starter …") if starting else (self.RED, "Bridgen kører ikke")
+        elif s.get("error"):
+            color, text = self.RED, "Fejl: " + str(s["error"])
+        elif mode == "login":
+            color, text = self.ORANGE, "Log ind på DeepSeek i Chrome-vinduet, og tryk så knap 2"
+        elif login == "nej":
+            color, text = self.RED, "Ikke logget ind – brug knap 1 og 2"
+        else:
+            color, text = self.GREEN, f"Klar – tryk {self.hk}"
+        self.banner.config(text=text, bg=color)
+
+        if last["ver"] != self.seen_ver:
+            self.seen_ver = last["ver"]
+            self.out.config(state="normal")
+            self.out.delete("1.0", "end")
+            self.out.insert("1.0", last["answer"] or ("Fejl: " + last["error"]))
+            self.out.config(state="disabled")
+        if self.pending_msg:
+            self.msg.config(text=self.pending_msg)
+            self.pending_msg = None
+        self.var_dot.set(cfg["dot"])
+
+
 # ------------------------------------------------------------------ Main
 def tray_icon():
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -330,8 +541,8 @@ def tray_icon():
         ui_q.put(("refresh",))
 
     menu = pystray.Menu(
+        pystray.MenuItem("Åbn vindue", lambda icon, item: ui_q.put(("window",)), default=True),
         pystray.MenuItem("Vis prik", toggle_dot, checked=lambda item: cfg["dot"]),
-        pystray.MenuItem("Åbn login / status", lambda icon, item: webbrowser.open(BRIDGE)),
         pystray.MenuItem("Afslut", lambda icon, item: ui_q.put(("quit",))))
     return pystray.Icon("SecretAI", img, f"SecretAI ({cfg['hotkey']})", menu)
 
@@ -341,6 +552,7 @@ def main():
     # Kun én kopi ad gangen
     mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\SecretAI_single_instance")
     if ctypes.windll.kernel32.GetLastError() == 183:
+        ctypes.windll.user32.MessageBoxW(None, "SecretAI kører allerede.\nDobbeltklik på det grønne ikon nederst til højre (evt. under pilen ^) for at åbne vinduet.", "SecretAI", 0x40)
         return
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -349,12 +561,17 @@ def main():
 
     start_bridge()
     root = tk.Tk()
-    dot = Dot(root)
+    root.withdraw()
+    dot = Dot(tk.Toplevel(root))
+    win = MainWin(root)
+    threading.Thread(target=poll_status, daemon=True).start()
     icon = tray_icon()
     listener = keyboard.Listener(win32_event_filter=win_filter)
     listener.start()
     icon.run_detached()
     log.info("SecretAI kører. Hotkey: %s", cfg["hotkey"])
+    if cfg["show_window_on_start"]:
+        win.show()
 
     def shutdown():
         listener.stop()
@@ -376,6 +593,8 @@ def main():
                     dot.show(m[1], m[2])
                 elif m[0] == "hide" or (m[0] == "refresh" and not cfg["dot"]):
                     dot.hide()
+                elif m[0] == "window":
+                    win.show()
                 elif m[0] == "quit":
                     return shutdown()
         except queue.Empty:
