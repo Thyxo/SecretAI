@@ -1,9 +1,10 @@
-# pip install playwright fastapi uvicorn   (kræver Google Chrome eller Edge installeret)
-# Start:  uvicorn ds_server:app --port 8000   → åbn http://localhost:8000
+# DeepSeek-bridge til SecretAI. Startes automatisk af secretai.py (kræver Google Chrome eller Edge).
+# Manuelt:  python -m uvicorn ds_server:app --host 127.0.0.1 --port 8000
+# API: POST /ask · POST /ask/stream · GET /status · GET /health · POST /admin/mode · POST /admin/quit
 import asyncio, json, os, shutil, subprocess, sys, time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 URL        = "https://chat.deepseek.com"
@@ -123,11 +124,16 @@ async def launch(mode: str):
 @asynccontextmanager
 async def lifespan(app):
     state["pw"] = await async_playwright().start()
-    try:                                       # første gang (ingen profil endnu) → login-tilstand
-        await launch("run" if os.path.isdir(PROFILE) else "login")
-    except Exception as e:
-        state["error"] = str(e)
+    state["mode"] = "starting"
+
+    async def boot():                          # første gang (ingen profil endnu) → login-tilstand
+        try:
+            await launch("run" if os.path.isdir(PROFILE) else "login")
+        except Exception as e:
+            state["error"] = str(e)
+    state["boot"] = asyncio.create_task(boot())   # serveren svarer med det samme, Chrome starter i baggrunden
     yield
+    await state["boot"]
     await stop_chrome()
     await state["pw"].stop()
 
@@ -137,9 +143,10 @@ app = FastAPI(lifespan=lifespan)
 
 async def get_page():
     """Returnér en levende fane – opret ny hvis den er lukket/crashet."""
+    await state["boot"]                        # vent hvis Chrome stadig er ved at starte
     page = state.get("page")
     if page is None:
-        raise HTTPException(409, "Browseren er i login-tilstand. Tryk «Jeg er logget ind» i GUI'en.")
+        raise HTTPException(409, "Browseren er i login-tilstand. Tryk «Jeg er logget ind» i SecretAI-vinduet.")
     if page.is_closed():
         page = await state["ctx"].new_page()
         state["page"] = page
@@ -171,7 +178,7 @@ async def ask_iter(q: str):
     except PWTimeout:
         await snap(page, "no-input")
         raise HTTPException(401, "Tekstfelt ikke fundet – logget ud, captcha eller ændret selector. "
-                                 "Åbn GUI'en og tryk «Åbn login-vindue».")
+                                 "Tryk «Åbn login-vindue» i SecretAI-vinduet.")
 
     await set_toggle(page, "DeepThink", DEEPTHINK)
     await set_toggle(page, "Search", SEARCH)
@@ -302,7 +309,7 @@ async def health():
     return {"browser": alive(), "busy": lock.locked(), "mode": state.get("mode")}
 
 
-# ---------------------------------------------------------------- GUI
+# ---------------------------------------------------------------- Status / styring (bruges af SecretAI-vinduet)
 @app.get("/status")
 async def status():
     mode = state.get("mode")
@@ -329,6 +336,7 @@ async def status():
 async def set_mode(body: dict):
     """headless=false → login-tilstand (normal Chrome). headless=true → kør (styret af scriptet)."""
     mode = "run" if body.get("headless") else "login"
+    await state["boot"]
     await take_lock()
     try:
         await launch(mode)
@@ -351,77 +359,3 @@ async def quit_server():
             os._exit(0)
     asyncio.create_task(_go())
     return {"ok": True}
-
-
-PAGE = """<!doctype html><html lang="da"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DeepSeek Bridge</title>
-<style>
- :root{--bg:#f5f6f8;--card:#fff;--tx:#1b1f24;--mut:#6b7380;--ok:#1a7f37;--bad:#c62828;--wait:#b26a00;--ac:#2563eb}
- @media(prefers-color-scheme:dark){:root{--bg:#14161a;--card:#1e2127;--tx:#e8eaed;--mut:#98a0ac;--ac:#5b8def}}
- *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--tx);font:16px system-ui,sans-serif}
- main{max-width:560px;margin:0 auto;padding:16px;display:grid;gap:14px}
- .card{background:var(--card);border-radius:14px;padding:16px;box-shadow:0 1px 3px #0002}
- h1{font-size:20px;margin:0} h2{font-size:15px;margin:0 0 10px;color:var(--mut);font-weight:600}
- .row{display:flex;align-items:center;gap:10px;margin:6px 0} .dot{width:12px;height:12px;border-radius:50%;background:var(--mut)}
- .ok{background:var(--ok)} .bad{background:var(--bad)} .wait{background:var(--wait)}
- button{font:inherit;padding:12px 14px;border:0;border-radius:10px;background:var(--ac);color:#fff;width:100%;margin-top:8px;cursor:pointer}
- button.sec{background:transparent;color:var(--ac);border:1px solid var(--ac)} button:disabled{opacity:.5}
- textarea{width:100%;font:inherit;padding:10px;border-radius:10px;border:1px solid var(--mut);background:var(--bg);color:var(--tx);resize:vertical}
- #out{white-space:pre-wrap;margin-top:10px;min-height:2em} .hint{color:var(--mut);font-size:14px}
-</style>
-<main>
- <h1>DeepSeek Bridge</h1>
- <div class="card"><h2>Status</h2>
-  <div class="row"><span class="dot" id="d1"></span><span id="t1">Browser …</span></div>
-  <div class="row"><span class="dot" id="d2"></span><span id="t2">Login …</span></div>
-  <div class="row"><span class="dot" id="d3"></span><span id="t3">Tilstand …</span></div>
- </div>
- <div class="card"><h2>Log ind</h2>
-  <p class="hint">1) Tryk «Åbn login-vindue». 2) Log ind på DeepSeek i det vindue, der åbner.
-   3) Tryk «Jeg er logget ind».</p>
-  <button id="b1">1 · Åbn login-vindue</button>
-  <button id="b2" class="sec">2 · Jeg er logget ind – kør usynligt</button>
-  <div id="msg" class="hint"></div>
- </div>
- <div class="card"><h2>Test et spørgsmål</h2>
-  <textarea id="q" rows="3" placeholder="Fx: Hvad koster et klippekort til S-toget?"></textarea>
-  <button id="b3">Send</button><div id="out"></div>
- </div>
- <p class="hint">API: POST /ask · POST /ask/stream · GET /status</p>
-</main>
-<script>
-const $=id=>document.getElementById(id), dot=(id,c)=>$(id).className='dot '+c;
-async function refresh(){
- try{const s=await (await fetch('/status')).json();
-  dot('d1',s.browser?'ok':'bad'); $('t1').textContent=s.error?('Fejl: '+s.error):(s.browser?'Chrome kører':'Chrome er lukket');
-  const L={ja:['ok','Logget ind'],nej:['bad','Ikke logget ind'],ukendt:['wait','Login ukendt']}[s.login];
-  dot('d2',L[0]); $('t2').textContent=L[1];
-  dot('d3',s.busy?'wait':'ok'); $('t3').textContent=(s.mode==='login'?'Login-tilstand (log ind i vinduet)':(s.headless?'Kører usynligt':'Kører'))+(s.busy?' · optaget':'');
- }catch(e){dot('d1','bad');$('t1').textContent='Server svarer ikke'}
-}
-async function mode(h,btn){
- btn.disabled=true; $('msg').textContent='Arbejder …';
- const r=await fetch('/admin/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({headless:h})});
- $('msg').textContent=r.ok?(h?'Kører nu usynligt.':'Vinduet er åbnet – log ind der.'):(await r.json()).detail;
- btn.disabled=false; refresh();
-}
-$('b1').onclick=e=>mode(false,e.target); $('b2').onclick=e=>mode(true,e.target);
-$('b3').onclick=async e=>{
- const b=e.target,o=$('out'); if(!$('q').value.trim())return; b.disabled=true; o.textContent='';
- const r=await fetch('/ask/stream',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({q:$('q').value})});
- if(!r.ok){o.textContent='Fejl: '+(await r.json()).detail;b.disabled=false;return}
- const rd=r.body.getReader(),dec=new TextDecoder();let buf='',txt='';
- while(true){const {done,value}=await rd.read(); if(done)break; buf+=dec.decode(value,{stream:true});
-  let i; while((i=buf.indexOf('\\n\\n'))>=0){const ev=buf.slice(0,i);buf=buf.slice(i+2);
-   const d=ev.split('\\n').find(l=>l.startsWith('data: '));if(!d||d.includes('[DONE]'))continue;
-   const j=JSON.parse(d.slice(6)); if(j.error)txt+='\\nFejl: '+j.error; else txt=j.replace??(txt+j.delta); o.textContent=txt;}}
- b.disabled=false; refresh();
-};
-refresh(); setInterval(refresh,3000);
-</script></html>"""
-
-
-@app.get("/", response_class=HTMLResponse)
-async def gui():
-    return PAGE
