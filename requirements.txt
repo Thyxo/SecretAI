@@ -1,0 +1,7 @@
+playwright
+fastapi
+uvicorn
+pynput
+pyperclip
+pystray
+pillow

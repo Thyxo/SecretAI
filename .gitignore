@@ -1,0 +1,6 @@
+ds-chrome/
+ds-profile/
+ds-debug/
+*.log
+config.json
+__pycache__/
